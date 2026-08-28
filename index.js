@@ -70,13 +70,12 @@ app.post('/verify-bundle', (req, res) => {
         }
     }
 
-    // 3. Inventory Computation (Hashes ALL present string files except itself)
+    // 3. Inventory Computation
     let recomputedInventory = [];
     const filesToHash = fileNames.filter(f => f !== 'inventory.json' && typeof files[f] === 'string');
     filesToHash.sort((a, b) => Buffer.from(a).compare(Buffer.from(b)));
 
     for (const f of filesToHash) {
-        // Pushing strictly in name,bytes,sha256 order guarantees correct JSON.stringify order
         recomputedInventory.push({
             name: f,
             bytes: byteLength(files[f]),
@@ -98,34 +97,35 @@ app.post('/verify-bundle', (req, res) => {
     }
 
     // 4. Adapter Config
+    let hasValidAdapterConfig = false;
     if ('adapter_config.json' in files && typeof files['adapter_config.json'] === 'string') {
         try {
             const config = JSON.parse(files['adapter_config.json']);
-            if (typeof config !== 'object' || config === null || Array.isArray(config)) {
-                addV('INVALID_ADAPTER_CONFIG');
-            } else {
+            if (typeof config === 'object' && config !== null && !Array.isArray(config)) {
                 const r = config.r;
                 const tm = config.target_modules;
                 let valid = true;
                 if (!Number.isSafeInteger(r) || r <= 0) valid = false;
                 if (!Array.isArray(tm) || tm.length === 0 || tm.some(x => typeof x !== 'string' || x === '')) valid = false;
                 if (valid && new Set(tm).size !== tm.length) valid = false;
-                if (!valid) addV('INVALID_ADAPTER_CONFIG');
+                
+                if (valid) hasValidAdapterConfig = true;
             }
         } catch (e) {
             addV('INVALID_JSON:adapter_config.json');
         }
     }
+    if (!hasValidAdapterConfig) addV('INVALID_ADAPTER_CONFIG');
 
     // 5. Training Manifest
     let parsedManifest = null;
+    let hasValidManifestStruct = false;
     if ('training_manifest.json' in files && typeof files['training_manifest.json'] === 'string') {
         try {
             parsedManifest = JSON.parse(files['training_manifest.json']);
-            if (typeof parsedManifest !== 'object' || parsedManifest === null || Array.isArray(parsedManifest)) {
-                addV('INVALID_TRAINING_MANIFEST');
-                parsedManifest = null;
-            } else {
+            if (typeof parsedManifest === 'object' && parsedManifest !== null && !Array.isArray(parsedManifest)) {
+                hasValidManifestStruct = true;
+                
                 if (typeof parsedManifest.base !== 'string' || !/^[a-f0-9]{40}$/.test(parsedManifest.base)) {
                     addV('MUTABLE_BASE_REVISION');
                 }
@@ -150,23 +150,26 @@ app.post('/verify-bundle', (req, res) => {
             addV('INVALID_JSON:training_manifest.json');
         }
     }
+    if (!hasValidManifestStruct) addV('INVALID_TRAINING_MANIFEST');
 
     // 6. Evaluation Validation
+    let hasValidEvalStruct = false;
     if ('evaluation.json' in files && typeof files['evaluation.json'] === 'string') {
         try {
             const parsedEval = JSON.parse(files['evaluation.json']);
-            if (typeof parsedEval !== 'object' || parsedEval === null || Array.isArray(parsedEval)) {
-                addV('INVALID_EVALUATION');
-            } else {
+            if (typeof parsedEval === 'object' && parsedEval !== null && !Array.isArray(parsedEval)) {
+                hasValidEvalStruct = true;
+                
                 let expectedModelDigest = null;
-                if (typeof files['adapter_model.safetensors'] === 'string') {
-                    expectedModelDigest = sha256(files['adapter_model.safetensors']);
-                } else if (parsedManifest && parsedManifest.modelArtifactDigest) {
+                if (parsedManifest && parsedManifest.modelArtifactDigest) {
                     expectedModelDigest = parsedManifest.modelArtifactDigest;
                 }
                 
-                if (!parsedEval.modelArtifactDigest || (expectedModelDigest && parsedEval.modelArtifactDigest !== expectedModelDigest)) {
+                if (expectedModelDigest && parsedEval.modelArtifactDigest !== expectedModelDigest) {
                     addV('EVALUATION_ARTIFACT_MISMATCH');
+                } else if (!expectedModelDigest && !parsedEval.modelArtifactDigest) {
+                    // Only flag mismatch if we couldn't resolve either
+                     addV('EVALUATION_ARTIFACT_MISMATCH');
                 }
 
                 if (typeof parsedEval.aggregate !== 'number' || !Number.isFinite(parsedEval.aggregate) || parsedEval.aggregate < 0 || parsedEval.aggregate > 1) {
@@ -190,6 +193,7 @@ app.post('/verify-bundle', (req, res) => {
             addV('INVALID_JSON:evaluation.json');
         }
     }
+    if (!hasValidEvalStruct) addV('INVALID_EVALUATION');
 
     // 7. Model Card Validation
     if ('README.md' in files && typeof files['README.md'] === 'string') {
@@ -208,7 +212,7 @@ app.post('/verify-bundle', (req, res) => {
                 payloads.push(readme.substring(lastIndex + prefix.length, endIndex));
                 lastIndex = endIndex + suffix.length;
             } else {
-                break; // Missing ending delimiter
+                break;
             }
         }
 
@@ -231,7 +235,6 @@ app.post('/verify-bundle', (req, res) => {
                     if (card.datasetDigest !== mManifest.datasetDigest) mismatch = true;
                     if (card.modelArtifactDigest !== mManifest.modelArtifactDigest) mismatch = true;
                     
-                    // Always validate policy mismatch regardless of valid manifest or not
                     if (policyValid) {
                         if (card.license !== policy.license) mismatch = true;
                         if (card.intendedUse !== policy.intendedUse) mismatch = true;
@@ -248,7 +251,7 @@ app.post('/verify-bundle', (req, res) => {
         }
     }
 
-    // 8. Array string output serialization (Strict Buffer Compare)
+    // 8. Output serialization
     const violationsArray = Array.from(violations).sort((a, b) => Buffer.from(a).compare(Buffer.from(b)));
     
     res.json({
