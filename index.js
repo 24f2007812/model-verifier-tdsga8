@@ -30,7 +30,7 @@ function byteLength(str) {
 
 app.post('/verify-bundle', (req, res) => {
     if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
-        !req.body.policy || typeof req.body.policy !== 'object' ||
+        !req.body.policy || typeof req.body.policy !== 'object' || Array.isArray(req.body.policy) ||
         !req.body.files || typeof req.body.files !== 'object' || Array.isArray(req.body.files)) {
         return res.status(400).json({ error: "INVALID_INPUT" });
     }
@@ -40,18 +40,19 @@ app.post('/verify-bundle', (req, res) => {
     const addV = (code) => violations.add(code);
 
     // 1. Policy Validation
-    let validPolicy = true;
-    if (!policy.requiredSlices || !Array.isArray(policy.requiredSlices) || policy.requiredSlices.length === 0) validPolicy = false;
-    else if (new Set(policy.requiredSlices).size !== policy.requiredSlices.length) validPolicy = false;
-    else if (policy.requiredSlices.some(s => typeof s !== 'string' || s === '')) validPolicy = false;
+    let policyValid = true;
+    if (!Array.isArray(policy.requiredSlices) || policy.requiredSlices.length === 0) {
+        policyValid = false;
+    } else {
+        if (policy.requiredSlices.some(s => typeof s !== 'string' || s === '')) policyValid = false;
+        if (new Set(policy.requiredSlices).size !== policy.requiredSlices.length) policyValid = false;
+    }
+    if (typeof policy.license !== 'string' || policy.license === '') policyValid = false;
+    if (typeof policy.intendedUse !== 'string' || policy.intendedUse === '') policyValid = false;
+    if (typeof policy.limitations !== 'string' || policy.limitations === '') policyValid = false;
+    if (!policyValid) addV('INVALID_POLICY');
 
-    if (typeof policy.license !== 'string' || policy.license === '') validPolicy = false;
-    if (typeof policy.intendedUse !== 'string' || policy.intendedUse === '') validPolicy = false;
-    if (typeof policy.limitations !== 'string' || policy.limitations === '') validPolicy = false;
-    
-    if (!validPolicy) addV('INVALID_POLICY');
-
-    // 2. File Presence & Untracked/Unsafe Files
+    // 2. File Presence & Untracked/Unsafe
     const fileNames = Object.keys(files);
     for (const reqFile of REQUIRED_FILES) {
         if (!fileNames.includes(reqFile)) {
@@ -60,7 +61,6 @@ app.post('/verify-bundle', (req, res) => {
             addV(`INVALID_FILE:${reqFile}`);
         }
     }
-
     for (const file of fileNames) {
         if (!REQUIRED_FILES.includes(file)) {
             addV('UNTRACKED_FILE');
@@ -70,28 +70,25 @@ app.post('/verify-bundle', (req, res) => {
         }
     }
 
-    // 3. Inventory Validation & Exact Bytes Recomputation
+    // 3. Inventory Computation (Hashes ALL present string files except itself)
     let recomputedInventory = [];
     const filesToHash = fileNames.filter(f => f !== 'inventory.json' && typeof files[f] === 'string');
-    
-    // Exact UTF-8 string sort
     filesToHash.sort((a, b) => Buffer.from(a).compare(Buffer.from(b)));
 
     for (const f of filesToHash) {
+        // Pushing strictly in name,bytes,sha256 order guarantees correct JSON.stringify order
         recomputedInventory.push({
             name: f,
             bytes: byteLength(files[f]),
             sha256: sha256(files[f])
         });
     }
-
     const exactCompactJson = JSON.stringify(recomputedInventory);
     const inventoryDigest = sha256(exactCompactJson);
 
-    if (files['inventory.json'] && typeof files['inventory.json'] === 'string') {
+    if ('inventory.json' in files && typeof files['inventory.json'] === 'string') {
         try {
             JSON.parse(files['inventory.json']);
-            // Must strictly match the recomputed compacted exact JSON payload
             if (files['inventory.json'] !== exactCompactJson) {
                 addV('INVENTORY_MISMATCH');
             }
@@ -100,78 +97,91 @@ app.post('/verify-bundle', (req, res) => {
         }
     }
 
-    // 4. Adapter Config Validation
-    if (files['adapter_config.json'] && typeof files['adapter_config.json'] === 'string') {
+    // 4. Adapter Config
+    if ('adapter_config.json' in files && typeof files['adapter_config.json'] === 'string') {
         try {
             const config = JSON.parse(files['adapter_config.json']);
-            if (typeof config !== 'object' || config === null || Array.isArray(config)) throw new Error();
-            
-            const r = config.r;
-            const tm = config.target_modules;
-            
-            if (!Number.isSafeInteger(r) || r <= 0) addV('INVALID_ADAPTER_CONFIG');
-            else if (!Array.isArray(tm) || tm.length === 0 || tm.some(x => typeof x !== 'string' || x === '') || new Set(tm).size !== tm.length) addV('INVALID_ADAPTER_CONFIG');
+            if (typeof config !== 'object' || config === null || Array.isArray(config)) {
+                addV('INVALID_ADAPTER_CONFIG');
+            } else {
+                const r = config.r;
+                const tm = config.target_modules;
+                let valid = true;
+                if (!Number.isSafeInteger(r) || r <= 0) valid = false;
+                if (!Array.isArray(tm) || tm.length === 0 || tm.some(x => typeof x !== 'string' || x === '')) valid = false;
+                if (valid && new Set(tm).size !== tm.length) valid = false;
+                if (!valid) addV('INVALID_ADAPTER_CONFIG');
+            }
         } catch (e) {
             addV('INVALID_JSON:adapter_config.json');
         }
     }
 
-    // 5. Training Manifest Validation & Binding
+    // 5. Training Manifest
     let parsedManifest = null;
-    if (files['training_manifest.json'] && typeof files['training_manifest.json'] === 'string') {
+    if ('training_manifest.json' in files && typeof files['training_manifest.json'] === 'string') {
         try {
             parsedManifest = JSON.parse(files['training_manifest.json']);
-            if (typeof parsedManifest !== 'object' || parsedManifest === null || Array.isArray(parsedManifest)) throw new Error();
-
-            if (typeof parsedManifest.base !== 'string' || !/^[a-f0-9]{40}$/.test(parsedManifest.base)) {
-                addV('MUTABLE_BASE_REVISION');
-            }
-
-            const manifestReqs = ['task', 'datasetDigest', 'codeDigest', 'trainingConfigDigest', 'modelArtifactDigest', 'evaluationArtifactDigest'];
-            for (const mf of manifestReqs) {
-                if (typeof parsedManifest[mf] !== 'string' || parsedManifest[mf] === '') {
-                    addV(`MISSING_MANIFEST_FIELD:${mf}`);
+            if (typeof parsedManifest !== 'object' || parsedManifest === null || Array.isArray(parsedManifest)) {
+                addV('INVALID_TRAINING_MANIFEST');
+                parsedManifest = null;
+            } else {
+                if (typeof parsedManifest.base !== 'string' || !/^[a-f0-9]{40}$/.test(parsedManifest.base)) {
+                    addV('MUTABLE_BASE_REVISION');
                 }
-            }
-
-            // Digest comparisons from exact recomputed files
-            if (parsedManifest.modelArtifactDigest && typeof files['adapter_model.safetensors'] === 'string') {
-                if (parsedManifest.modelArtifactDigest !== sha256(files['adapter_model.safetensors'])) addV('MODEL_ARTIFACT_MISMATCH');
-            }
-            if (parsedManifest.evaluationArtifactDigest && typeof files['evaluation.json'] === 'string') {
-                if (parsedManifest.evaluationArtifactDigest !== sha256(files['evaluation.json'])) addV('EVALUATION_DIGEST_MISMATCH');
+                const manifestReqs = ['task', 'datasetDigest', 'codeDigest', 'trainingConfigDigest', 'modelArtifactDigest', 'evaluationArtifactDigest'];
+                for (const mf of manifestReqs) {
+                    if (typeof parsedManifest[mf] !== 'string' || parsedManifest[mf] === '') {
+                        addV(`MISSING_MANIFEST_FIELD:${mf}`);
+                    }
+                }
+                if (parsedManifest.modelArtifactDigest && typeof files['adapter_model.safetensors'] === 'string') {
+                    if (parsedManifest.modelArtifactDigest !== sha256(files['adapter_model.safetensors'])) {
+                        addV('MODEL_ARTIFACT_MISMATCH');
+                    }
+                }
+                if (parsedManifest.evaluationArtifactDigest && typeof files['evaluation.json'] === 'string') {
+                    if (parsedManifest.evaluationArtifactDigest !== sha256(files['evaluation.json'])) {
+                        addV('EVALUATION_DIGEST_MISMATCH');
+                    }
+                }
             }
         } catch (e) {
             addV('INVALID_JSON:training_manifest.json');
         }
-    } else if (!violations.has('MISSING_FILE:training_manifest.json') && !violations.has('INVALID_FILE:training_manifest.json')) {
-        addV('INVALID_TRAINING_MANIFEST');
     }
 
-    // 6. Evaluation Binding and Ranges
-    if (files['evaluation.json'] && typeof files['evaluation.json'] === 'string') {
+    // 6. Evaluation Validation
+    if ('evaluation.json' in files && typeof files['evaluation.json'] === 'string') {
         try {
             const parsedEval = JSON.parse(files['evaluation.json']);
-            if (typeof parsedEval !== 'object' || parsedEval === null || Array.isArray(parsedEval)) throw new Error();
+            if (typeof parsedEval !== 'object' || parsedEval === null || Array.isArray(parsedEval)) {
+                addV('INVALID_EVALUATION');
+            } else {
+                let expectedModelDigest = null;
+                if (typeof files['adapter_model.safetensors'] === 'string') {
+                    expectedModelDigest = sha256(files['adapter_model.safetensors']);
+                } else if (parsedManifest && parsedManifest.modelArtifactDigest) {
+                    expectedModelDigest = parsedManifest.modelArtifactDigest;
+                }
+                
+                if (!parsedEval.modelArtifactDigest || (expectedModelDigest && parsedEval.modelArtifactDigest !== expectedModelDigest)) {
+                    addV('EVALUATION_ARTIFACT_MISMATCH');
+                }
 
-            const actualModelDigest = typeof files['adapter_model.safetensors'] === 'string' ? sha256(files['adapter_model.safetensors']) : undefined;
-            if (actualModelDigest && parsedEval.modelArtifactDigest !== actualModelDigest) {
-                addV('EVALUATION_ARTIFACT_MISMATCH');
-            }
+                if (typeof parsedEval.aggregate !== 'number' || !Number.isFinite(parsedEval.aggregate) || parsedEval.aggregate < 0 || parsedEval.aggregate > 1) {
+                    addV('INVALID_AGGREGATE');
+                }
 
-            if (typeof parsedEval.aggregate !== 'number' || !Number.isFinite(parsedEval.aggregate) || parsedEval.aggregate < 0 || parsedEval.aggregate > 1) {
-                addV('INVALID_AGGREGATE');
-            }
-
-            if (Array.isArray(policy.requiredSlices)) {
-                for (const slice of policy.requiredSlices) {
-                    if (typeof slice !== 'string') continue;
-                    if (!(slice in parsedEval)) {
-                        addV(`MISSING_SLICE:${slice}`);
-                    } else {
-                        const val = parsedEval[slice];
-                        if (typeof val !== 'number' || !Number.isFinite(val) || val < 0 || val > 1) {
-                            addV(`SLICE_RANGE:${slice}`);
+                if (policyValid && Array.isArray(policy.requiredSlices)) {
+                    for (const slice of policy.requiredSlices) {
+                        if (!(slice in parsedEval)) {
+                            addV(`MISSING_SLICE:${slice}`);
+                        } else {
+                            const val = parsedEval[slice];
+                            if (typeof val !== 'number' || !Number.isFinite(val) || val < 0 || val > 1) {
+                                addV(`SLICE_RANGE:${slice}`);
+                            }
                         }
                     }
                 }
@@ -179,12 +189,10 @@ app.post('/verify-bundle', (req, res) => {
         } catch (e) {
             addV('INVALID_JSON:evaluation.json');
         }
-    } else if (!violations.has('MISSING_FILE:evaluation.json') && !violations.has('INVALID_FILE:evaluation.json')) {
-        addV('INVALID_EVALUATION');
     }
 
     // 7. Model Card Validation
-    if (files['README.md'] && typeof files['README.md'] === 'string') {
+    if ('README.md' in files && typeof files['README.md'] === 'string') {
         const readme = files['README.md'];
         const prefix = '<!-- tds-model-card ';
         const suffix = '-->';
@@ -200,13 +208,13 @@ app.post('/verify-bundle', (req, res) => {
                 payloads.push(readme.substring(lastIndex + prefix.length, endIndex));
                 lastIndex = endIndex + suffix.length;
             } else {
-                break;
+                break; // Missing ending delimiter
             }
         }
 
         if (markerCount === 0) {
-            addV('MODEL_CARD_COUNT');
             addV('MISSING_MODEL_CARD');
+            addV('MODEL_CARD_COUNT');
         } else if (markerCount > 1) {
             addV('MODEL_CARD_COUNT');
         } else {
@@ -215,24 +223,24 @@ app.post('/verify-bundle', (req, res) => {
                 if (typeof card !== 'object' || card === null || Array.isArray(card)) {
                     addV('INVALID_MODEL_CARD');
                 } else {
-                    let cardMismatch = false;
+                    let mismatch = false;
+                    const mManifest = parsedManifest || {}; 
                     
-                    if (parsedManifest) {
-                        if (card.task !== parsedManifest.task ||
-                            card.baseRevision !== parsedManifest.base ||
-                            card.datasetDigest !== parsedManifest.datasetDigest ||
-                            card.modelArtifactDigest !== parsedManifest.modelArtifactDigest) {
-                            cardMismatch = true;
-                        }
-                    }
+                    if (card.task !== mManifest.task) mismatch = true;
+                    if (card.baseRevision !== mManifest.base) mismatch = true;
+                    if (card.datasetDigest !== mManifest.datasetDigest) mismatch = true;
+                    if (card.modelArtifactDigest !== mManifest.modelArtifactDigest) mismatch = true;
                     
-                    if (card.license !== policy.license ||
-                        card.intendedUse !== policy.intendedUse ||
-                        card.limitations !== policy.limitations) {
-                        cardMismatch = true;
+                    // Always validate policy mismatch regardless of valid manifest or not
+                    if (policyValid) {
+                        if (card.license !== policy.license) mismatch = true;
+                        if (card.intendedUse !== policy.intendedUse) mismatch = true;
+                        if (card.limitations !== policy.limitations) mismatch = true;
+                    } else {
+                        mismatch = true;
                     }
 
-                    if (cardMismatch) addV('MODEL_CARD_MISMATCH');
+                    if (mismatch) addV('MODEL_CARD_MISMATCH');
                 }
             } catch (e) {
                 addV('INVALID_MODEL_CARD');
@@ -240,7 +248,7 @@ app.post('/verify-bundle', (req, res) => {
         }
     }
 
-    // 8. Output Serialization - Ensure UTF-8 byte ordering for keys!
+    // 8. Array string output serialization (Strict Buffer Compare)
     const violationsArray = Array.from(violations).sort((a, b) => Buffer.from(a).compare(Buffer.from(b)));
     
     res.json({
