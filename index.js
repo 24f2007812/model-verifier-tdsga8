@@ -4,9 +4,8 @@ const bodyParser = require('body-parser');
 
 const app = express();
 
-// Increase payload limit for model strings
 app.use(bodyParser.json({ limit: '50mb' }));
-// Handle malformed root JSON
+
 app.use((err, req, res, next) => {
     if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
         return res.status(400).json({ error: 'INVALID_INPUT' });
@@ -30,7 +29,6 @@ function byteLength(str) {
 }
 
 app.post('/verify-bundle', (req, res) => {
-    // 1. Initial Input Validation
     if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
         !req.body.policy || typeof req.body.policy !== 'object' ||
         !req.body.files || typeof req.body.files !== 'object' || Array.isArray(req.body.files)) {
@@ -39,20 +37,21 @@ app.post('/verify-bundle', (req, res) => {
 
     const { policy, files } = req.body;
     let violations = new Set();
-    let inventoryDigest = "";
-
-    // Helper to add violation
     const addV = (code) => violations.add(code);
 
-    // 2. Policy Validation
-    if (!policy.requiredSlices || !Array.isArray(policy.requiredSlices) || policy.requiredSlices.length === 0 ||
-        !policy.license || typeof policy.license !== 'string' ||
-        !policy.intendedUse || typeof policy.intendedUse !== 'string' ||
-        !policy.limitations || typeof policy.limitations !== 'string') {
-        addV('INVALID_POLICY');
-    }
+    // 1. Policy Validation
+    let validPolicy = true;
+    if (!policy.requiredSlices || !Array.isArray(policy.requiredSlices) || policy.requiredSlices.length === 0) validPolicy = false;
+    else if (new Set(policy.requiredSlices).size !== policy.requiredSlices.length) validPolicy = false;
+    else if (policy.requiredSlices.some(s => typeof s !== 'string' || s === '')) validPolicy = false;
 
-    // 3. File Presence & Untracked/Unsafe Files
+    if (typeof policy.license !== 'string' || policy.license === '') validPolicy = false;
+    if (typeof policy.intendedUse !== 'string' || policy.intendedUse === '') validPolicy = false;
+    if (typeof policy.limitations !== 'string' || policy.limitations === '') validPolicy = false;
+    
+    if (!validPolicy) addV('INVALID_POLICY');
+
+    // 2. File Presence & Untracked/Unsafe Files
     const fileNames = Object.keys(files);
     for (const reqFile of REQUIRED_FILES) {
         if (!fileNames.includes(reqFile)) {
@@ -65,39 +64,35 @@ app.post('/verify-bundle', (req, res) => {
     for (const file of fileNames) {
         if (!REQUIRED_FILES.includes(file)) {
             addV('UNTRACKED_FILE');
-            if (UNSAFE_EXTENSIONS.some(ext => file.endsWith(ext))) {
-                addV('UNSAFE_WEIGHTS');
-            }
+        }
+        if (UNSAFE_EXTENSIONS.some(ext => file.endsWith(ext))) {
+            addV('UNSAFE_WEIGHTS');
         }
     }
 
-    // 4. Inventory Validation & Recomputation
+    // 3. Inventory Validation & Exact Bytes Recomputation
     let recomputedInventory = [];
-    const filesToHash = REQUIRED_FILES.filter(f => f !== 'inventory.json');
-    filesToHash.sort();
+    const filesToHash = fileNames.filter(f => f !== 'inventory.json' && typeof files[f] === 'string');
+    
+    // Exact UTF-8 string sort
+    filesToHash.sort((a, b) => Buffer.from(a).compare(Buffer.from(b)));
 
     for (const f of filesToHash) {
-        if (files[f] && typeof files[f] === 'string') {
-            recomputedInventory.push({
-                name: f,
-                bytes: byteLength(files[f]),
-                sha256: sha256(files[f])
-            });
-        }
+        recomputedInventory.push({
+            name: f,
+            bytes: byteLength(files[f]),
+            sha256: sha256(files[f])
+        });
     }
 
     const exactCompactJson = JSON.stringify(recomputedInventory);
-    inventoryDigest = sha256(exactCompactJson);
+    const inventoryDigest = sha256(exactCompactJson);
 
-    let parsedInventory = null;
     if (files['inventory.json'] && typeof files['inventory.json'] === 'string') {
         try {
-            parsedInventory = JSON.parse(files['inventory.json']);
-            if (!Array.isArray(parsedInventory)) throw new Error();
-            
-            // Compare items
-            const incomingStr = JSON.stringify(parsedInventory);
-            if (incomingStr !== exactCompactJson) {
+            JSON.parse(files['inventory.json']);
+            // Must strictly match the recomputed compacted exact JSON payload
+            if (files['inventory.json'] !== exactCompactJson) {
                 addV('INVENTORY_MISMATCH');
             }
         } catch (e) {
@@ -105,7 +100,7 @@ app.post('/verify-bundle', (req, res) => {
         }
     }
 
-    // 5. Adapter Config Validation
+    // 4. Adapter Config Validation
     if (files['adapter_config.json'] && typeof files['adapter_config.json'] === 'string') {
         try {
             const config = JSON.parse(files['adapter_config.json']);
@@ -114,63 +109,54 @@ app.post('/verify-bundle', (req, res) => {
             const r = config.r;
             const tm = config.target_modules;
             
-            let valid = true;
-            if (!Number.isSafeInteger(r) || r <= 0) valid = false;
-            if (!Array.isArray(tm) || tm.length === 0 || !tm.every(x => typeof x === 'string')) valid = false;
-            if (valid && new Set(tm).size !== tm.length) valid = false; // Check unique
-
-            if (!valid) addV('INVALID_ADAPTER_CONFIG');
+            if (!Number.isSafeInteger(r) || r <= 0) addV('INVALID_ADAPTER_CONFIG');
+            else if (!Array.isArray(tm) || tm.length === 0 || tm.some(x => typeof x !== 'string' || x === '') || new Set(tm).size !== tm.length) addV('INVALID_ADAPTER_CONFIG');
         } catch (e) {
             addV('INVALID_JSON:adapter_config.json');
         }
     }
 
-    // 6. Training Manifest Validation
+    // 5. Training Manifest Validation & Binding
     let parsedManifest = null;
     if (files['training_manifest.json'] && typeof files['training_manifest.json'] === 'string') {
         try {
             parsedManifest = JSON.parse(files['training_manifest.json']);
             if (typeof parsedManifest !== 'object' || parsedManifest === null || Array.isArray(parsedManifest)) throw new Error();
 
-            if (!parsedManifest.base || typeof parsedManifest.base !== 'string' || !/^[a-f0-9]{40}$/.test(parsedManifest.base)) {
+            if (typeof parsedManifest.base !== 'string' || !/^[a-f0-9]{40}$/.test(parsedManifest.base)) {
                 addV('MUTABLE_BASE_REVISION');
             }
 
             const manifestReqs = ['task', 'datasetDigest', 'codeDigest', 'trainingConfigDigest', 'modelArtifactDigest', 'evaluationArtifactDigest'];
             for (const mf of manifestReqs) {
-                if (!parsedManifest[mf]) addV(`MISSING_MANIFEST_FIELD:${mf}`);
+                if (typeof parsedManifest[mf] !== 'string' || parsedManifest[mf] === '') {
+                    addV(`MISSING_MANIFEST_FIELD:${mf}`);
+                }
             }
 
-            // Digest match checks
-            if (parsedManifest.modelArtifactDigest && files['adapter_model.safetensors']) {
-                if (parsedManifest.modelArtifactDigest !== sha256(files['adapter_model.safetensors'])) {
-                    addV('MODEL_ARTIFACT_MISMATCH');
-                }
+            // Digest comparisons from exact recomputed files
+            if (parsedManifest.modelArtifactDigest && typeof files['adapter_model.safetensors'] === 'string') {
+                if (parsedManifest.modelArtifactDigest !== sha256(files['adapter_model.safetensors'])) addV('MODEL_ARTIFACT_MISMATCH');
             }
-            if (parsedManifest.evaluationArtifactDigest && files['evaluation.json']) {
-                if (parsedManifest.evaluationArtifactDigest !== sha256(files['evaluation.json'])) {
-                    addV('EVALUATION_DIGEST_MISMATCH');
-                }
+            if (parsedManifest.evaluationArtifactDigest && typeof files['evaluation.json'] === 'string') {
+                if (parsedManifest.evaluationArtifactDigest !== sha256(files['evaluation.json'])) addV('EVALUATION_DIGEST_MISMATCH');
             }
         } catch (e) {
             addV('INVALID_JSON:training_manifest.json');
         }
-    } else {
+    } else if (!violations.has('MISSING_FILE:training_manifest.json') && !violations.has('INVALID_FILE:training_manifest.json')) {
         addV('INVALID_TRAINING_MANIFEST');
     }
 
-    // 7. Evaluation Validation
-    let parsedEval = null;
+    // 6. Evaluation Binding and Ranges
     if (files['evaluation.json'] && typeof files['evaluation.json'] === 'string') {
         try {
-            parsedEval = JSON.parse(files['evaluation.json']);
+            const parsedEval = JSON.parse(files['evaluation.json']);
             if (typeof parsedEval !== 'object' || parsedEval === null || Array.isArray(parsedEval)) throw new Error();
 
-            // Binding check
-            if (parsedManifest && parsedManifest.modelArtifactDigest) {
-                if (parsedEval.modelArtifactDigest !== parsedManifest.modelArtifactDigest) {
-                    addV('EVALUATION_ARTIFACT_MISMATCH');
-                }
+            const actualModelDigest = typeof files['adapter_model.safetensors'] === 'string' ? sha256(files['adapter_model.safetensors']) : undefined;
+            if (actualModelDigest && parsedEval.modelArtifactDigest !== actualModelDigest) {
+                addV('EVALUATION_ARTIFACT_MISMATCH');
             }
 
             if (typeof parsedEval.aggregate !== 'number' || !Number.isFinite(parsedEval.aggregate) || parsedEval.aggregate < 0 || parsedEval.aggregate > 1) {
@@ -193,11 +179,11 @@ app.post('/verify-bundle', (req, res) => {
         } catch (e) {
             addV('INVALID_JSON:evaluation.json');
         }
-    } else {
-         addV('INVALID_EVALUATION');
+    } else if (!violations.has('MISSING_FILE:evaluation.json') && !violations.has('INVALID_FILE:evaluation.json')) {
+        addV('INVALID_EVALUATION');
     }
 
-    // 8. Model Card (README.md) Validation
+    // 7. Model Card Validation
     if (files['README.md'] && typeof files['README.md'] === 'string') {
         const readme = files['README.md'];
         const prefix = '<!-- tds-model-card ';
@@ -214,7 +200,7 @@ app.post('/verify-bundle', (req, res) => {
                 payloads.push(readme.substring(lastIndex + prefix.length, endIndex));
                 lastIndex = endIndex + suffix.length;
             } else {
-                break; // Malformed boundary
+                break;
             }
         }
 
@@ -224,29 +210,29 @@ app.post('/verify-bundle', (req, res) => {
         } else if (markerCount > 1) {
             addV('MODEL_CARD_COUNT');
         } else {
-            // Exactly 1 marker
             try {
                 const card = JSON.parse(payloads[0]);
                 if (typeof card !== 'object' || card === null || Array.isArray(card)) {
                     addV('INVALID_MODEL_CARD');
                 } else {
-                    // Match machine manifests and policy
-                    const expectedFields = {
-                        task: parsedManifest ? parsedManifest.task : undefined,
-                        baseRevision: parsedManifest ? parsedManifest.base : undefined,
-                        datasetDigest: parsedManifest ? parsedManifest.datasetDigest : undefined,
-                        modelArtifactDigest: parsedManifest ? parsedManifest.modelArtifactDigest : undefined,
-                        license: policy.license,
-                        intendedUse: policy.intendedUse,
-                        limitations: policy.limitations
-                    };
-
-                    for (const [key, expectedValue] of Object.entries(expectedFields)) {
-                        if (expectedValue !== undefined && card[key] !== expectedValue) {
-                            addV('MODEL_CARD_MISMATCH');
-                            break;
+                    let cardMismatch = false;
+                    
+                    if (parsedManifest) {
+                        if (card.task !== parsedManifest.task ||
+                            card.baseRevision !== parsedManifest.base ||
+                            card.datasetDigest !== parsedManifest.datasetDigest ||
+                            card.modelArtifactDigest !== parsedManifest.modelArtifactDigest) {
+                            cardMismatch = true;
                         }
                     }
+                    
+                    if (card.license !== policy.license ||
+                        card.intendedUse !== policy.intendedUse ||
+                        card.limitations !== policy.limitations) {
+                        cardMismatch = true;
+                    }
+
+                    if (cardMismatch) addV('MODEL_CARD_MISMATCH');
                 }
             } catch (e) {
                 addV('INVALID_MODEL_CARD');
@@ -254,8 +240,8 @@ app.post('/verify-bundle', (req, res) => {
         }
     }
 
-    // 9. Format Response
-    const violationsArray = Array.from(violations).sort();
+    // 8. Output Serialization - Ensure UTF-8 byte ordering for keys!
+    const violationsArray = Array.from(violations).sort((a, b) => Buffer.from(a).compare(Buffer.from(b)));
     
     res.json({
         decision: violationsArray.length === 0 ? "admit" : "reject",
